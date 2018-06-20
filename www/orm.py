@@ -61,20 +61,22 @@ def execute(sql,args):
             raise
         return affected
 
+#用于生成?,?,?,的格式
 def create_args_string(num):
     L=[]
     for n in range(num):
         L.append('?')
     return ','.join(L)
 
+#创建基类，Field
 class Field(object):
-
+    #初始化基类，包括属性的名字、属性的类型、主键和默认值
     def __init__(sefl,name,column_type,primary_key,default):
         self.name=name
         self.column_type=column_type
         self.primary_key=primary_key
         self.default=default
-
+    #初始化SQL相关的显示语句。格式为：<属性的名字，属性的类型：类名或表名>
     def __str__(self):
         return '<%s,%s:%s>' %(self.__class__.__name__,self.column_type,self.name)
 
@@ -99,12 +101,16 @@ class TextField(Field):
     def __init__(self,name=None,default=None):
         super.__init__(name,'text',False,default)
 
+#创建model的元数据类，用于将具体的子类与数据库表的映射信息读取出来
 class ModelMetaclass(type):
     def __new__(cls,name,bases,attrs):
+        #需要排除model类本身，要不然会报错，因为model并不存在数据库的表中
         if name=='Model':
             return type.__new__(cls,name,bases,attrs)
+        #获取表名
         tableName=attrs.get('__table__',None) or name
         logging.info('found Model: %s (table:%s)' % (name,tableName))
+        #获取所有的Field和主键名:
         mappings=dict()
         fields=[]
         primaryKey=None
@@ -128,14 +134,104 @@ class ModelMetaclass(type):
         attrs['__table__']=tableName
         attrs['__primary_key__']=primary_key#主键属性名
         attrs['__fields__']=fields#除主键以后的属性名
+        #构造默认的SELECT, INSERT, UPDATE和DELETE语句:
         attrs['__select__']='select `%s`,%s from`%s`' % (primaryKey,','.join(escaped_fields),tableName)
         attrs['__insert__']='insert into `%s`(%s,`%s`) values (%s)' % (tableName,','join(escaped_fields),primaryKey,create_args_string(len(escaped_fields)+1))
         attrs['__update__']='update `%s` set %s where `%s`=?' % (tableName,','join(map(lambda f:'`%s`=?' % (mappings.get(f).name or f),fields)),primaryKey)
         attrs['__delete__']='delete from `%s` where `%s`=?' % (tableName,primaryKey)
         return type.__new__(cls,name,bases,attrs)
-        
-        
-        
+
+#创建基类MODEL，用于做表对象的父类        
+class Model(dict,metaclass=ModelMetaclass):
+    def __init__(self, **kw):
+        super(Model, self).__init__(**kw)
+    #get方法定义，内部获取数据
+    def __getattr__(self,key):
+        try:
+            return self[key]
+        except keyError:
+            raise AttributeError(r"'Model object has no attribute '%s'" % key)
+    #set方法定义，内部存储数据
+    def __setattr__(self,key,value):
+        self[key]=value
+    #外部根据KEY获取数据
+    def getValue(self,key):
+        return getattr(self,key,None)
+    #获取某个属性的值，如果该对象的该属性还没有赋值，就去获取它对应的列的默认值
+    def getValueOrDefault(self,key):
+        value=getattr(self,key,None)
+        if value is None:
+            fileld=self.__mappings__[key]
+            if field.default is not None:
+                value=field.default() if callable (field.default) else field.default
+                logging.debug('using default value for %s:%s' % (key,str(value)))
+                seattr(self,key,value)
+        return value
+    @classmethod
+    async def findAll(cls,where=None,args=None,**kw):
+        'find objects by where clause.'
+        sql=[cls.__select__]
+        if where:
+            sql.append('where')
+            sql.append(where)
+        if args is None:
+            args=[]
+        orderBy= kw.get('orderBy',None)
+        if orderBy:
+            sql.append('order by')
+            sql.append(orderBy)
+        limit=kw.get('limit',None)
+        if limit is not None:
+            sql.append('limit')
+            if isinstance(limit,int):
+                sql.append('?')
+                args.append(limit)
+            elif isinstance(limit,tuple) and len(limit)==2:
+                sql.append('?','?')
+                args.extend(limit)
+            else:
+                raise ValueError('Invalid limit value:%s' % str(limit))
+        rs= await select(' '.join(sql),args)
+        return[cls(**r) for r in rs]
+    
+    @classmethod
+    async def findNumber(cls,selectField,where=None,args=None):
+        sql=['select %s _num_ from `%s`' % (selectField,cls.__table__)]
+        if where:
+            sql.append('where')
+            sql.append(where)
+        rs= await select(''.join(sql),args,1)
+        if len(rs)==0:
+            return None
+        return rs[0]['_num_']
+
+
+    @classmethod
+    async def find(cls,pk):
+        rs = await select('%s where `%s`=?' % (cls.__select__,cls.__primary_key__),[pk],1)
+        if len(rs)==0:
+            return None
+        return cls(**rs[0])
+
+    async def save(self):
+        args=list(map(self.getValueOrDefault,self.__fields__))
+        args.append(self.getValueOrDefault(self.__primary_key__))
+        rows=await execute(self.__insert__,args)
+        if rows !=1:
+            logging.warn('failed to insert record:affected rows:%s' % rows)
+
+    async def update(self):
+        args=list(map(self.getValue,self.__fields__))
+        args.append(self.getValue(self.__primary_key__))
+        rows=await execute(self.__update__,args)
+        if rows !=1:
+            logging.warn('failed to update by primary key:affected rows:%s' % rows)
+
+    async def remove(self):
+        args=[self.getValue(self.__primary_key__)]
+        rows=await execute(self.__delete__,args)
+        if rows !=1:
+            logging.warn('failed to remove by primary_key: affected rows:%s' % rows)
 
 
         
